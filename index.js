@@ -33,8 +33,9 @@ async function jellyFetch(guildId, endpoint, options = {}) {
   const res = await fetch(url, {
     ...options,
     headers: {
+      'X-Emby-Token': cfg.apiToken,
       'Content-Type': 'application/json',
-  'X-Emby-Authorization': 'MediaBrowser Client="JellyBot", Device="JellyBot", DeviceId="jellybot-discord", Version="1.0.0"',
+      ...(options.headers || {}),
     },
   });
   if (!res.ok) throw new Error(`Jellyfin API error: ${res.status} ${res.statusText}`);
@@ -44,10 +45,14 @@ async function jellyFetch(guildId, endpoint, options = {}) {
 async function jellyAuth(serverUrl, username, password) {
   const res = await fetch(`${serverUrl.replace(/\/$/, '')}/Users/AuthenticateByName`, {
     method: 'POST',
-    headers: { 'Content-Type': 'application/json' },
+    headers: {
+      'Content-Type': 'application/json',
+      // Jellyfin requires this header for authentication — omitting it causes 400 Bad Request
+      'X-Emby-Authorization': 'MediaBrowser Client="JellyBot", Device="JellyBot", DeviceId="jellybot-discord", Version="1.0.0"',
+    },
     body: JSON.stringify({ Username: username, Pw: password }),
   });
-  if (!res.ok) throw new Error(`Auth failed: ${res.status}`);
+  if (!res.ok) throw new Error(`Auth failed: ${res.status} ${res.statusText}`);
   return res.json();
 }
 
@@ -279,10 +284,20 @@ async function handleWatch(interaction, itemId, itemTitle) {
   const user = interaction.user;
 
   try {
+    const cfg = getServerConfig(guildId);
+
+    // Resolve userId first — needed for user-scoped item endpoints (avoids 400 on strict Jellyfin installs)
+    const userId = cfg.userId || (await jellyFetch(guildId, '/Users'))[0]?.Id;
+    if (!userId) throw new Error('Could not resolve a Jellyfin user. Re-run `/config` with credentials.');
+
+    // Fetch item via user-scoped endpoint; plain /Items/{id} returns 400 on many servers
     let title = itemTitle;
+    let mediaSourceId = itemId;
     if (!title) {
-      const item = await jellyFetch(guildId, `/Items/${itemId}`);
+      const item = await jellyFetch(guildId, `/Users/${userId}/Items/${itemId}`);
       title = item.Name;
+      // MediaSourceId is required by the stream endpoint; fall back to itemId if absent
+      if (item.MediaSources?.length) mediaSourceId = item.MediaSources[0].Id ?? itemId;
     }
 
     const party = {
@@ -297,8 +312,14 @@ async function handleWatch(interaction, itemId, itemTitle) {
     };
     watchParties.set(guildId, party);
 
-    const cfg = getServerConfig(guildId);
-    const streamUrl = `${cfg.serverUrl.replace(/\/$/, '')}/Videos/${itemId}/stream?api_key=${cfg.apiToken}`;
+    // Static=true → direct file serve (no transcode negotiation).
+    // MediaSourceId is required by most Jellyfin installs or the endpoint returns 400 Bad Request.
+    const streamParams = new URLSearchParams({
+      api_key: cfg.apiToken,
+      Static: 'true',
+      MediaSourceId: mediaSourceId,
+    });
+    const streamUrl = `${cfg.serverUrl.replace(/\/$/, '')}/Videos/${itemId}/stream?${streamParams}`;
 
     const embed = jellyEmbed(`🎬 Watch Party Started!`)
       .setDescription(`**${title}**\n\nA watch party has begun! Use the buttons below to manage it.`)
@@ -471,10 +492,22 @@ async function handleStream(interaction) {
   const itemId = interaction.options.getString('item_id');
 
   try {
-    const item = await jellyFetch(guildId, `/Items/${itemId}`);
     const cfg = getServerConfig(guildId);
-    const streamUrl = `${cfg.serverUrl.replace(/\/$/, '')}/Videos/${itemId}/stream?api_key=${cfg.apiToken}`;
-    const hlsUrl = `${cfg.serverUrl.replace(/\/$/, '')}/Videos/${itemId}/master.m3u8?api_key=${cfg.apiToken}`;
+
+    // Resolve userId for user-scoped item endpoint
+    const userId = cfg.userId || (await jellyFetch(guildId, '/Users'))[0]?.Id;
+    if (!userId) throw new Error('Could not resolve a Jellyfin user. Re-run `/config` with credentials.');
+
+    // User-scoped endpoint returns MediaSources; plain /Items/{id} returns 400 on many servers
+    const item = await jellyFetch(guildId, `/Users/${userId}/Items/${itemId}`);
+    const mediaSourceId = item.MediaSources?.[0]?.Id ?? itemId;
+
+    // Static=true + MediaSourceId required to avoid 400 Bad Request on the stream endpoint
+    const streamParams = new URLSearchParams({ api_key: cfg.apiToken, Static: 'true', MediaSourceId: mediaSourceId });
+    const hlsParams = new URLSearchParams({ api_key: cfg.apiToken, MediaSourceId: mediaSourceId });
+
+    const streamUrl = `${cfg.serverUrl.replace(/\/$/, '')}/Videos/${itemId}/stream?${streamParams}`;
+    const hlsUrl = `${cfg.serverUrl.replace(/\/$/, '')}/Videos/${itemId}/master.m3u8?${hlsParams}`;
 
     const embed = jellyEmbed(`🔗 Stream Links: ${item.Name}`)
       .addFields(
