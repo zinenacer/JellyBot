@@ -33,9 +33,8 @@ async function jellyFetch(guildId, endpoint, options = {}) {
   const res = await fetch(url, {
     ...options,
     headers: {
-      'X-Emby-Token': cfg.apiToken,
       'Content-Type': 'application/json',
-      ...(options.headers || {}),
+  'X-Emby-Authorization': 'MediaBrowser Client="JellyBot", Device="JellyBot", DeviceId="jellybot-discord", Version="1.0.0"',
     },
   });
   if (!res.ok) throw new Error(`Jellyfin API error: ${res.status} ${res.statusText}`);
